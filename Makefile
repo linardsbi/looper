@@ -3,8 +3,8 @@
 DEPENDENCIES = sdl2 SDL2_mixer
 
 CXX = clang++
-CXXFLAGS = -std=c++2b -Os -march=native -Wall -Wextra -Wpedantic -Wconversion -flto
-DEBUGFLAGS = -std=c++2b -fsanitize=address,undefined -g
+CXXFLAGS = -std=c++2b -Os -march=native -flto
+DEBUGFLAGS = -std=c++2b -fsanitize=address,undefined -g -Wall -Wextra -Wpedantic -Wconversion
 CFLAGS = `pkg-config --cflags ${DEPENDENCIES}`
 LIBS = `pkg-config --libs ${DEPENDENCIES}`
 

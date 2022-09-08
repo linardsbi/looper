@@ -3,17 +3,24 @@
 #include <string_view>
 #include <iostream>
 #include <cassert>
+#include <span>
 #include <SDL.h>
+#include <cstring>
 #include "SDL_mixer.h"
 
 using sample_t = int32_t;
-static constexpr auto bars = 600;
+static constexpr auto bars = 600U;
 static std::array<sample_t, bars> volume_graph;
+static Mix_Chunk* original_wave;
+
+template<typename T>
+static T map(long x, long in_min, long in_max, long out_min, long out_max) {
+        return static_cast<T>((x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min);
+};
 
 static int analyze_sample(Mix_Chunk *wave) {
     Uint16 format;
     int channels, incr;
-    Uint8 *start = wave->abuf;
     Uint8 *end = wave->abuf + wave->alen;
     int frequency{};
 
@@ -29,15 +36,15 @@ static int analyze_sample(Mix_Chunk *wave) {
     const auto samples_in_bar = sample_frames / bars;
     sample_t bar_value = (*((sample_t *) wave->abuf));
     int sample_count = 0;
-    int bar_num = 0;
+    std::size_t bar_num = 0;
     for (auto *current = (sample_t *) wave->abuf;
          current != (sample_t *)end;
          std::advance(current, 1), ++sample_count) {
 
-        bar_value = std::lerp((*current), bar_value, 0.5);
+        bar_value = static_cast<sample_t>(std::lerp((*current), bar_value, 0.5));
 
         if (sample_count == static_cast<int>(samples_in_bar) && bar_num < bars) {
-            volume_graph[bar_num++] = bar_value;
+            volume_graph.at(bar_num++) = bar_value;
             sample_count = 0;
         }
     }
@@ -132,6 +139,7 @@ static SDL_Rect needle = {
 };
 
 int needle_pos{};
+int needle_end_pos{visualizer.x + visualizer_w - 4};
 bool select_handled = false;
 
 void calc_new_x(const auto &mouse_pos) {
@@ -141,14 +149,14 @@ void calc_new_x(const auto &mouse_pos) {
     }
 
     needle_pos += (visualizer_w * 10) / sample_length_ms;
-    needle.x = visualizer.x + (needle_pos / 10) * frametime;
+    needle.x = static_cast<int>(visualizer.x + (needle_pos / 10) * frametime);
 
-    if ((needle.x) >= visualizer.x + visualizer_w - 4) {
+    if ((needle.x) >= needle_end_pos) {
         if (Mix_Playing(0)) { // fixme: this is going to be inaccurate
-            needle.x = visualizer.x + 4 * frametime;
+            needle.x = static_cast<int>(visualizer.x + 4 * frametime);
             needle_pos = 0;
         } else {
-            needle.x = visualizer.x + visualizer_w - 4;
+            needle.x = needle_end_pos;
         }
     }
 }
@@ -167,13 +175,18 @@ void render_needle() {
         } else if (!is_selecting && select_handled) {
             auto span_w = mouse_pos.x - span.x;
             span.w = span_w;
-            select_handled = false;
+            
+            const auto span_start_pos = span.w > 0 ? span.x : span.x + span.w;
+            needle_pos = span_start_pos;
+            needle_end_pos = span.w < 0 ? span.x : span.x + span.w;
         }
     }
     
     if (span.w != 0) {
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 128);
         SDL_RenderFillRect( renderer, &span );
+    } else {
+        needle_end_pos = visualizer.x + visualizer_w - 4;
     }
 
     SDL_SetRenderDrawColor(renderer, 255, 18, 18, 255);
@@ -181,6 +194,51 @@ void render_needle() {
     calc_new_x(mouse_pos);
 
     SDL_RenderFillRect( renderer, &needle );
+}
+
+static Mix_Chunk slice;
+
+auto get_sample_span() {
+    const auto span_start = span.w > 0 ? span.x : span.x + span.w;
+    const auto span_end = span.w < 0 ? span.x : span.x + span.w;
+
+    // fixme: there has to be a better way
+    // get the relative position in the sample, round it to the nearest multiple of sample_t to avoid misalignment
+    const auto sample_start = map<std::size_t>(span_start, visualizer.x, visualizer.x + visualizer.w, 0, original_wave->alen) & -sizeof(sample_t);
+    const auto sample_end = map<std::size_t>(span_end, visualizer.x, visualizer.x + visualizer.w, 0, original_wave->alen) & -sizeof(sample_t);
+    
+    assert(sample_start >= 0 && sample_end < original_wave->alen);
+
+    return std::pair{sample_start, sample_end - sample_start};
+}
+
+void play_slice() {
+    auto create_slice = []() -> Mix_Chunk* {
+        const auto [slice_start, slice_len] = get_sample_span();
+        slice.volume = original_wave->volume;
+        slice.allocated = 1;
+
+        if (slice.abuf == nullptr || slice_len > slice.alen) {
+            if (slice.abuf != nullptr) {
+                delete [] slice.abuf;
+            } 
+            slice.abuf = new uint8_t[slice_len];
+        }
+
+        slice.alen = static_cast<uint32_t>(slice_len);
+        
+        std::memcpy(slice.abuf, original_wave->abuf + slice_start, slice_len);
+
+        return &slice;
+    };
+
+    if (span.w == 0) {
+        return;
+    }
+
+    if (Mix_PlayChannel(0, create_slice(), 0) < 0) {
+        SDL_Log("Couldn't play slice: %s\n",SDL_GetError());
+    }
 }
 
 void render_frame() {
@@ -194,20 +252,20 @@ void render_frame() {
 
     SDL_SetRenderDrawColor( renderer, 0x00, 0x00, 0xFF, 0xFF );
 
-    auto map = [](long x, long in_min, long in_max, long out_min, long out_max) {
-          return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
-    };
-
+    // fixme: these values can be saved in analyze_sample()
     const auto [min, max] = std::minmax_element(volume_graph.begin(), volume_graph.end());
 
-    const auto offset = static_cast<double>(visualizer_w) / static_cast<double>(bars);
-    for (int i = 1; i < bars; ++i) {
-        const auto x1 = static_cast<int>(visualizer.x + offset * i);
+    const auto offset = static_cast<double>(visualizer_w) / bars;
+    for (std::size_t i = 1; i < bars; ++i) {
+        const auto x1 = static_cast<int>(visualizer.x + offset * static_cast<double>(i));
         const auto y1 = visualizer.y + visualizer_h - 2;
         const auto x2 = x1;
-        auto y2 = map(volume_graph[i] - static_cast<long>(*min), *min, *max, 0, visualizer.h) + visualizer.y - 2;
+
+        // offset the graph to the bottom of the visualizer 
+        auto y2 = map<int>(volume_graph[i] - static_cast<long>(*min), *min, *max, 0, visualizer.h) + visualizer.y - 2;
 
         if (y2 > y1) {
+            // invert negative portion of wave
             y2 = y1 - (y2 - y1);
         }
 
@@ -215,6 +273,11 @@ void render_frame() {
     }
 
     render_needle();
+
+    if (!is_selecting && select_handled) {
+        play_slice();
+        select_handled = false;
+    }
 
     SDL_SetRenderTarget( renderer, nullptr );
     
@@ -292,25 +355,24 @@ int main() {
     renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
 
-    std::string_view filename = "test2.wav";
-    auto *wave = Mix_LoadWAV(filename.data());
+    std::string_view filename = "test.wav";
+    original_wave = Mix_LoadWAV(filename.data());
 
-    if (wave == nullptr) {
+    if (original_wave == nullptr) {
         SDL_Log("Couldn't load %s: %s\n", filename.data(), SDL_GetError());
         return 1;
     }
 
-
     if (reverse_sample) {
-        flip_sample(wave);
+        flip_sample(original_wave);
     }
 
-    Mix_PlayChannel(0, wave, loops);
+    Mix_PlayChannel(0, original_wave, loops);
 
     std::cout << "Playing: " << filename << '\n';
     bool exit = false;
 
-    sample_length_ms = analyze_sample(wave);
+    sample_length_ms = analyze_sample(original_wave);
     while (!exit) {
         render_frame();
         exit = handle_input();
