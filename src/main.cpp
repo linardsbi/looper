@@ -3,7 +3,7 @@
 #include <string_view>
 #include <iostream>
 #include <cassert>
-#include <span>
+#include <memory>
 #include <SDL.h>
 #include <cstring>
 #include "SDL_mixer.h"
@@ -12,10 +12,11 @@ using sample_t = int32_t;
 static constexpr auto bars = 600U;
 static std::array<sample_t, bars> volume_graph;
 static Mix_Chunk* original_wave;
+static bool looping = false;
 
 template<typename T>
 static T map(long x, long in_min, long in_max, long out_min, long out_max) {
-        return static_cast<T>((x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min);
+    return static_cast<T>((x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min);
 };
 
 static int analyze_sample(Mix_Chunk *wave) {
@@ -49,7 +50,7 @@ static int analyze_sample(Mix_Chunk *wave) {
         }
     }
 
-    return static_cast<int>((sample_frames * 1000) / frequency);
+    return static_cast<int>(std::ceil((sample_frames * 1000) / frequency));
 }
 
 static void flip_sample(Mix_Chunk *wave)
@@ -138,25 +139,32 @@ static SDL_Rect needle = {
     .h = visualizer_h - 2
 };
 
-int needle_pos{};
-int needle_end_pos{visualizer.x + visualizer_w - 4};
+std::pair<int, int> needle_area{visualizer.x, visualizer.x + visualizer_w - 4};
+int needle_pos{}; // relative
 bool select_handled = false;
 
 void calc_new_x(const auto &mouse_pos) {
+    static bool reverse = false;
+
     if (SDL_PointInRect(&mouse_pos, &visualizer)) {
         needle.x = mouse_pos.x;
         return;
     }
 
-    needle_pos += (visualizer_w * 10) / sample_length_ms;
-    needle.x = static_cast<int>(visualizer.x + (needle_pos / 10) * frametime);
+    needle_pos += ((visualizer_w * 100) / sample_length_ms) * (reverse && looping ? -1 : 1);
+    needle.x = static_cast<int>(std::round(needle_area.first + (needle_pos * frametime) / 100));
 
-    if ((needle.x) >= needle_end_pos) {
+    if (needle.x > needle_area.second || needle.x < needle_area.first) {
         if (Mix_Playing(0)) { // fixme: this is going to be inaccurate
-            needle.x = static_cast<int>(visualizer.x + 4 * frametime);
+            if (looping) {
+                reverse = !reverse;
+                return;
+            }
+
             needle_pos = 0;
+            needle.x = needle_area.first;
         } else {
-            needle.x = needle_end_pos;
+            needle.x = needle_area.second;
         }
     }
 }
@@ -172,21 +180,23 @@ void render_needle() {
             span.w = 0;
             span.h = needle.h;
             select_handled = true;
+            needle_area = {visualizer.x, visualizer.x + visualizer_w - 4};
+            looping = false;
         } else if (!is_selecting && select_handled) {
             auto span_w = mouse_pos.x - span.x;
             span.w = span_w;
             
             const auto span_start_pos = span.w > 0 ? span.x : span.x + span.w;
-            needle_pos = span_start_pos;
-            needle_end_pos = span.w < 0 ? span.x : span.x + span.w;
+
+            needle_pos = 0;
+            needle_area.first = span_start_pos;
+            needle_area.second = span.w < 0 ? span_start_pos + (-span.w) : span.x + span.w;
         }
     }
     
     if (span.w != 0) {
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 128);
         SDL_RenderFillRect( renderer, &span );
-    } else {
-        needle_end_pos = visualizer.x + visualizer_w - 4;
     }
 
     SDL_SetRenderDrawColor(renderer, 255, 18, 18, 255);
@@ -196,6 +206,8 @@ void render_needle() {
     SDL_RenderFillRect( renderer, &needle );
 }
 
+// this creates popping sounds
+// todo: stitch these together and use the "loop" parameter on Mix_PlayChannel() ?
 static Mix_Chunk slice;
 
 auto get_sample_span() {
@@ -214,20 +226,34 @@ auto get_sample_span() {
 
 void play_slice() {
     auto create_slice = []() -> Mix_Chunk* {
+        // fixme: error-prone naming
         const auto [slice_start, slice_len] = get_sample_span();
         slice.volume = original_wave->volume;
         slice.allocated = 1;
 
-        if (slice.abuf == nullptr || slice_len > slice.alen) {
+        if (slice.abuf == nullptr || slice_len * 2 > slice.alen) {
             if (slice.abuf != nullptr) {
                 delete [] slice.abuf;
             } 
-            slice.abuf = new uint8_t[slice_len];
+            slice.abuf = new uint8_t[slice_len * 2];
         }
 
-        slice.alen = static_cast<uint32_t>(slice_len);
-        
+        slice.alen = static_cast<uint32_t>(slice_len * 2);
         std::memcpy(slice.abuf, original_wave->abuf + slice_start, slice_len);
+
+        // fixme: avoid all this by memcpy-ing the slice into both halves of the buffer and flipping only the second half
+        std::unique_ptr<uint8_t[]> reversed_buffer(new uint8_t[slice_len]);
+
+        Mix_Chunk reversed_slice {
+            .allocated = 1,
+            .abuf = reversed_buffer.get(),
+            .alen = static_cast<uint32_t>(slice_len),
+            .volume = original_wave->volume,
+        };
+
+        std::memcpy(reversed_slice.abuf, slice.abuf, slice_len);
+        flip_sample(&reversed_slice);
+        std::memcpy(slice.abuf + slice_len, reversed_slice.abuf, slice_len);
 
         return &slice;
     };
@@ -236,9 +262,8 @@ void play_slice() {
         return;
     }
 
-    if (Mix_PlayChannel(0, create_slice(), 0) < 0) {
-        SDL_Log("Couldn't play slice: %s\n",SDL_GetError());
-    }
+    Mix_PlayChannel(0, create_slice(), -1);
+    looping = true;
 }
 
 void render_frame() {
@@ -275,8 +300,8 @@ void render_frame() {
     render_needle();
 
     if (!is_selecting && select_handled) {
-        play_slice();
         select_handled = false;
+        play_slice();
     }
 
     SDL_SetRenderTarget( renderer, nullptr );
@@ -286,41 +311,12 @@ void render_frame() {
     SDL_RenderPresent( renderer );
 }
 
-// int dx{1};
-// int dy{1};
-// double speed{0.35};
-
-// void render_bounce_frame() {
-//     auto update_visualizer = []() {
-//         if (visualizer.x + visualizer.w > window_width || visualizer.x < 0) {
-//             dx = -dx;
-//         }
-
-//         if (visualizer.y + visualizer.h > window_height || visualizer.y < 0) {
-//             dy = -dy;
-//         }
-
-//         visualizer.x += static_cast<int>(dx * speed * frametime);
-//         visualizer.y += static_cast<int>(dy * speed * frametime);
-//     };
-
-//     SDL_SetRenderDrawColor(renderer, 18, 18, 18, 255);
-//     SDL_RenderClear(renderer);
-
-//     update_visualizer();
-    
-//     SDL_SetRenderDrawColor(renderer, 255, 0, 255, 255);
-//     SDL_RenderFillRect(renderer, &visualizer);
-
-//     SDL_RenderPresent(renderer);
-// }
-
 int main() {
     auto audio_rate = 48000;
     auto audio_format = static_cast<uint16_t>(AUDIO_S32);
     auto audio_channels = 1;
-    constexpr auto loops = 1;
-    constexpr auto reverse_sample = true;
+    constexpr auto loops = 0;
+    constexpr auto reverse_sample = false;
 
 	if (SDL_Init(SDL_INIT_AUDIO) < 0 || SDL_Init( SDL_INIT_VIDEO ) < 0) {
         SDL_Log("Couldn't initialize SDL: %s\n",SDL_GetError());
